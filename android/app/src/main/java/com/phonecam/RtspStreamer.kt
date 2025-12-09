@@ -1,6 +1,7 @@
 package com.phonecam
 
 import android.content.Context
+import android.hardware.camera2.CaptureRequest
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -9,8 +10,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import android.util.Range
 import android.util.Size
 import android.view.Surface
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
@@ -210,10 +213,19 @@ class RtspStreamer(
                 
                 cameraProvider?.unbindAll()
 
-                // Preview for encoder (high resolution)
-                val encoderPreview = Preview.Builder()
+                // Preview for encoder with 60fps target using Camera2 Interop
+                val previewBuilder = Preview.Builder()
                     .setTargetResolution(Size(WIDTH, HEIGHT))
-                    .build()
+                
+                // Use Camera2 Interop to request 60fps
+                @Suppress("UnsafeOptInUsageError")
+                Camera2Interop.Extender(previewBuilder)
+                    .setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                        Range(FPS, FPS)
+                    )
+                
+                val encoderPreview = previewBuilder.build()
 
                 val cameraSelector = CameraSelector.Builder()
                     .requireLensFacing(CameraSelector.LENS_FACING_BACK)
