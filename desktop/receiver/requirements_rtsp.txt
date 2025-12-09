@@ -1,0 +1,10 @@
+# PhoneCam RTSP Receiver - Requirements
+# For the simpler H.264 over TCP streaming solution
+
+# Core dependencies
+av~=12.0                    # FFmpeg Python bindings for H.264 decoding
+numpy==1.26.4               # Array processing
+pyvirtualcam==0.14.0        # Virtual camera (Unity Capture backend)
+
+# Optional: for frame resizing if needed
+opencv-python==4.10.0.84

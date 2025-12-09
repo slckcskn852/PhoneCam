@@ -11,26 +11,25 @@ Unity Capture is a **Windows kernel-mode driver** that requires system-level ins
 
 ## Distribution Strategy
 
-### Option 1: Bundled Installer (Recommended)
-1. Download Unity Capture from: https://github.com/schellingb/UnityCapture/releases
-2. Extract the release files
-3. Include in your distribution folder:
-   ```
-   PhoneCam-Distribution/
-   ├── PhoneCam-Server.exe
-   ├── UnityCapture/
-   │   ├── Install.cmd
-   │   ├── Uninstall.cmd
-   │   └── (other Unity Capture files)
-   └── README.txt
-   ```
+### Option 1: Bundled with Installer (Recommended)
+Include Unity Capture from the project's `UnityCapture-master` folder:
 
-4. In README.txt, instruct users:
-   - Run `UnityCapture\Install.cmd` as Administrator (one-time setup)
-   - Then run `PhoneCam-Server.exe` normally
+```
+PhoneCam-Distribution/
+├── PhoneCam-RTSP-Receiver.exe
+├── UnityCapture/
+│   ├── Install.bat
+│   ├── Uninstall.bat
+│   └── (other Unity Capture files from Install folder)
+└── README.txt
+```
+
+In README.txt, instruct users:
+1. Run `UnityCapture\Install.bat` as Administrator (one-time setup)
+2. Then run `PhoneCam-RTSP-Receiver.exe` normally
 
 ### Option 2: Auto-Detect and Prompt
-Modify the server to detect if Unity Capture is installed and provide helpful guidance:
+The receiver already detects if Unity Capture is installed and shows an error if not found:
 
 ```python
 def check_unity_capture():
@@ -46,17 +45,22 @@ if not check_unity_capture():
     messagebox.showerror(
         "Unity Capture Not Found",
         "Unity Capture virtual camera driver is not installed.\n\n"
-        "Please run UnityCapture\\Install.cmd as Administrator,\n"
+        "Please run UnityCapture\\Install.bat as Administrator,\n"
         "then restart this application."
     )
     sys.exit(1)
 ```
 
-### Option 3: Alternative Virtual Camera (Fully Portable)
-Consider using **OBS Virtual Camera** which can be more easily distributed:
-- OBS provides a standalone virtual camera plugin
-- Can potentially be packaged as a portable installation
-- However, still requires some system integration
+## Building the EXE
+
+```powershell
+cd desktop\receiver
+pyinstaller PhoneCam-RTSP-Receiver.spec
+```
+
+Output: `dist\PhoneCam-RTSP-Receiver.exe` (~80-85 MB)
+
+The EXE includes all Python dependencies (PyAV, OpenCV, pyvirtualcam, etc.)
 
 ## Current Best Practice
 
