@@ -4,11 +4,14 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.util.Size
 import android.view.Surface
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -18,6 +21,7 @@ import java.io.OutputStream
 import java.net.Socket
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -27,9 +31,14 @@ import java.util.concurrent.atomic.AtomicLong
  * Protocol: Raw H.264 Annex B stream over TCP
  * - Each NAL unit prefixed with 0x00000001 start code
  * - SPS/PPS sent with each keyframe for decoder resilience
+ * 
+ * Features:
+ * - Adjustable bitrate (5-100 Mbps)
+ * - Zoom support via CameraX
  */
 class RtspStreamer(
     private val context: Context,
+    initialBitrateMbps: Int = 15,
     private val statusCallback: (String) -> Unit
 ) {
     companion object {
@@ -37,7 +46,6 @@ class RtspStreamer(
         private const val WIDTH = 1920
         private const val HEIGHT = 1080
         private const val FPS = 60
-        private const val BITRATE = 15_000_000 // 15 Mbps fixed
         private const val I_FRAME_INTERVAL = 1 // Keyframe every 1 second
     }
 
@@ -47,6 +55,7 @@ class RtspStreamer(
     private val networkHandler = Handler(networkThread.looper)
 
     private var cameraProvider: ProcessCameraProvider? = null
+    private var camera: Camera? = null
     private var encoder: MediaCodec? = null
     private var encoderInputSurface: Surface? = null
     private var socket: Socket? = null
@@ -60,6 +69,39 @@ class RtspStreamer(
     private var pps: ByteArray? = null
 
     private val cameraExecutor = Executors.newSingleThreadExecutor()
+    
+    // Adjustable bitrate (in Mbps, capped at 30)
+    private val currentBitrateMbps = AtomicInteger(initialBitrateMbps.coerceIn(5, 30))
+    
+    // Current zoom level
+    private var currentZoom = 1.0f
+    
+    // Zoom state callback
+    var onZoomStateChanged: ((minZoom: Float, maxZoom: Float, currentZoom: Float) -> Unit)? = null
+
+    /**
+     * Set bitrate in Mbps (5-30)
+     * Note: Changes take effect on next connection
+     */
+    fun setBitrate(mbps: Int) {
+        currentBitrateMbps.set(mbps.coerceIn(5, 30))
+        Log.d(TAG, "Bitrate set to ${currentBitrateMbps.get()} Mbps")
+    }
+    
+    /**
+     * Set zoom level
+     * Applied immediately to camera if streaming
+     */
+    fun setZoom(zoom: Float) {
+        currentZoom = zoom
+        camera?.cameraControl?.setZoomRatio(zoom)
+        Log.d(TAG, "Zoom set to ${zoom}x")
+    }
+    
+    /**
+     * Get the camera instance for external zoom control
+     */
+    fun getCamera(): Camera? = camera
 
     fun connect(serverUrl: String, lifecycleOwner: LifecycleOwner) {
         if (isStreaming.get()) {
@@ -86,7 +128,7 @@ class RtspStreamer(
                 
                 socket = Socket(host, port).apply {
                     tcpNoDelay = true
-                    sendBufferSize = 1024 * 1024 // 1MB buffer
+                    sendBufferSize = 65536 // Smaller buffer for lower latency
                     soTimeout = 5000
                 }
                 outputStream = socket!!.getOutputStream()
@@ -109,10 +151,12 @@ class RtspStreamer(
 
     private fun startEncoder(lifecycleOwner: LifecycleOwner) {
         try {
+            val bitrate = currentBitrateMbps.get() * 1_000_000
+            
             // Create H.264 encoder
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, BITRATE)
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
                 setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
@@ -121,7 +165,9 @@ class RtspStreamer(
                 try {
                     setInteger(MediaFormat.KEY_LATENCY, 0)
                     setInteger(MediaFormat.KEY_PRIORITY, 0)
-                    setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                    }
                 } catch (e: Exception) {
                     Log.w(TAG, "Some low-latency keys not supported")
                 }
@@ -133,7 +179,7 @@ class RtspStreamer(
                 start()
             }
 
-            Log.d(TAG, "Encoder created: ${WIDTH}x${HEIGHT}@${FPS}fps, ${BITRATE/1_000_000}Mbps")
+            Log.d(TAG, "Encoder created: ${WIDTH}x${HEIGHT}@${FPS}fps, ${currentBitrateMbps.get()}Mbps")
             
             isStreaming.set(true)
             frameCount.set(0)
@@ -164,7 +210,8 @@ class RtspStreamer(
                 
                 cameraProvider?.unbindAll()
 
-                val preview = Preview.Builder()
+                // Preview for encoder (high resolution)
+                val encoderPreview = Preview.Builder()
                     .setTargetResolution(Size(WIDTH, HEIGHT))
                     .build()
 
@@ -173,7 +220,7 @@ class RtspStreamer(
                     .build()
 
                 // Provide encoder surface to camera
-                preview.setSurfaceProvider { request ->
+                encoderPreview.setSurfaceProvider { request ->
                     encoderInputSurface?.let { surface ->
                         request.provideSurface(surface, cameraExecutor) { result ->
                             Log.d(TAG, "Encoder surface result: ${result.resultCode}")
@@ -181,14 +228,24 @@ class RtspStreamer(
                     }
                 }
 
-                cameraProvider?.bindToLifecycle(
+                // Bind preview to camera
+                camera = cameraProvider?.bindToLifecycle(
                     lifecycleOwner,
                     cameraSelector,
-                    preview
+                    encoderPreview
                 )
+                
+                // Apply current zoom and observe zoom state
+                camera?.cameraControl?.setZoomRatio(currentZoom)
+                
+                // Notify zoom state for UI
+                camera?.cameraInfo?.zoomState?.observeForever { state ->
+                    onZoomStateChanged?.invoke(state.minZoomRatio, state.maxZoomRatio, state.zoomRatio)
+                }
 
                 Log.d(TAG, "Camera bound to encoder")
-                statusCallback("Streaming 1080p60 @ 15Mbps")
+                val mbps = currentBitrateMbps.get()
+                statusCallback("Streaming 1080p60 @ ${mbps}Mbps")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Camera binding failed", e)
@@ -253,8 +310,9 @@ class RtspStreamer(
                                     if (count % 60 == 0L) {
                                         val elapsed = (System.currentTimeMillis() - streamStartTime) / 1000.0
                                         val fps = if (elapsed > 0) count / elapsed else 0.0
+                                        val mbps = currentBitrateMbps.get()
                                         ContextCompat.getMainExecutor(context).execute {
-                                            statusCallback("Streaming: ${String.format("%.1f", fps)} fps")
+                                            statusCallback("Streaming: ${String.format("%.1f", fps)} fps @ ${mbps}Mbps")
                                         }
                                     }
                                 }

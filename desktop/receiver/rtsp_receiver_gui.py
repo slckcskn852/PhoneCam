@@ -35,12 +35,17 @@ logger = logging.getLogger(__name__)
 
 
 class H264StreamDecoder:
-    """Decodes H.264 Annex B stream"""
+    """Decodes H.264 Annex B stream with low-latency settings"""
     
     def __init__(self):
         self.codec = av.CodecContext.create('h264', 'r')
-        self.codec.thread_type = 'AUTO'
-        self.codec.thread_count = 0
+        # Low-latency decoder settings
+        self.codec.thread_type = 'SLICE'  # Decode slices in parallel for lower latency
+        self.codec.thread_count = 4
+        self.codec.options = {
+            'flags': 'low_delay',
+            'flags2': 'fast',
+        }
         self.frame_count = 0
         self.start_time = time.time()
         
@@ -145,7 +150,9 @@ class StreamServer:
                 try:
                     self.client_socket, addr = self.server_socket.accept()
                     self.client_socket.settimeout(5.0)
+                    # Low-latency socket options
                     self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)  # Smaller buffer = lower latency
                     
                     logger.info(f"Client connected: {addr}")
                     self.status_callback(f"Connected: {addr[0]}")
@@ -180,7 +187,8 @@ class StreamServer:
         try:
             while self.running:
                 try:
-                    data = self.client_socket.recv(65536)
+                    # Smaller recv for lower latency (process data sooner)
+                    data = self.client_socket.recv(32768)
                 except socket.timeout:
                     continue
                     
@@ -247,7 +255,7 @@ class PhoneCamGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("PhoneCam RTSP Receiver")
-        self.root.geometry("450x300")
+        self.root.geometry("450x350")
         self.root.resizable(False, False)
         
         # Server
