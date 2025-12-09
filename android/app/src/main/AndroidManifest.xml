@@ -18,7 +18,7 @@
         android:theme="@style/Theme.PhoneCam"
         android:networkSecurityConfig="@xml/network_security_config">
         <activity
-            android:name="com.phonecam.MainActivity"
+            android:name="com.phonecam.RtspMainActivity"
             android:exported="true"
             android:screenOrientation="sensorLandscape"
             android:configChanges="keyboard|keyboardHidden|orientation|screenSize">
@@ -27,5 +27,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name="com.phonecam.MainActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize" />
     </application>
 </manifest>

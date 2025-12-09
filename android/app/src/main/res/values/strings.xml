@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">PhoneCam</string>
     <string name="default_signaling_url">http://192.168.0.131:8000/offer</string>
+    <string name="default_rtsp_url">192.168.0.131:5000</string>
 </resources>
