@@ -10,7 +10,6 @@ If I saved you some headaches from dealing with all these phone to webcam apps w
 
 [![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/donate/?hosted_button_id=&business=scitalia852@gmail.com&currency_code=USD)
 
-**PayPal**: scitalia852@gmail.com
 
 Your support helps maintain and improve PhoneCam. Thank you! ❤️
 
