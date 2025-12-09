@@ -7,11 +7,12 @@ Features:
 - Unity Capture virtual camera output
 - Real-time FPS and bitrate display
 - One-click start/stop
+- Rotation support (receives rotation from phone)
+- Low-latency CPU decoding with multithreading
 """
 
-import asyncio
 import logging
-import queue
+import os
 import socket
 import sys
 import threading
@@ -20,8 +21,15 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Optional
 
-import av
 import numpy as np
+import cv2
+
+# PyAV for H.264 decoding
+try:
+    import av
+    PYAV_AVAILABLE = True
+except ImportError:
+    PYAV_AVAILABLE = False
 
 try:
     import pyvirtualcam
@@ -33,23 +41,28 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
+# Rotation protocol: 0xFF + 'R' + 'T' + rotation_value + 0xAA (5 bytes total)
+# Using non-ASCII prefix/suffix to avoid false positives in H.264 data
+ROTATION_MAGIC_PREFIX = b'\xffRT'
+ROTATION_SUFFIX = 0xAA
+
 
 class H264StreamDecoder:
-    """Decodes H.264 Annex B stream with low-latency settings"""
+    """Low-latency H.264 decoder using PyAV with multithreading"""
     
     def __init__(self):
         self.codec = av.CodecContext.create('h264', 'r')
-        # Low-latency decoder settings
-        self.codec.thread_type = 'SLICE'  # Decode slices in parallel for lower latency
-        self.codec.thread_count = 4
-        self.codec.options = {
-            'flags': 'low_delay',
-            'flags2': 'fast',
-        }
+        self.codec.thread_type = 'SLICE'
+        self.codec.thread_count = 8
+        self.codec.options = {'flags': 'low_delay', 'flags2': 'fast'}
         self.frame_count = 0
         self.start_time = time.time()
+        self.hw_accel = "CPU (8 threads)"
+        
+        logger.info("H.264 decoder initialized (PyAV, 8 threads, low-latency)")
         
     def decode(self, data: bytes) -> list:
+        """Decode H.264 NAL unit data and return BGR frames"""
         frames = []
         try:
             packet = av.Packet(data)
@@ -58,8 +71,11 @@ class H264StreamDecoder:
                 frames.append(img)
                 self.frame_count += 1
         except Exception as e:
-            pass
+            pass  # Skip decode errors (common with streaming)
         return frames
+    
+    def close(self):
+        pass  # Nothing to clean up
     
     @property
     def fps(self) -> float:
@@ -106,10 +122,11 @@ class VirtualCamera:
 class StreamServer:
     """TCP server for receiving H.264 stream"""
     
-    def __init__(self, port: int, status_callback, stats_callback):
+    def __init__(self, port: int, status_callback, stats_callback, decoder_callback=None):
         self.port = port
         self.status_callback = status_callback
         self.stats_callback = stats_callback
+        self.decoder_callback = decoder_callback
         self.running = False
         self.server_socket = None
         self.client_socket = None
@@ -180,9 +197,16 @@ class StreamServer:
         if not self.virtual_cam.start():
             self.status_callback("Virtual camera failed! Install Unity Capture")
         
+        # Show decoder type
+        decoder_info = self.decoder.hw_accel if self.decoder.hw_accel else "CPU (Software)"
+        self.status_callback("Connected")
+        if self.decoder_callback:
+            self.decoder_callback(f"Decoder: {decoder_info}")
+        
         buffer = bytearray()
         bytes_received = 0
         last_stats_time = time.time()
+        current_rotation = 0  # Rotation in degrees (0, 90, 180, 270)
         
         try:
             while self.running:
@@ -198,6 +222,28 @@ class StreamServer:
                 buffer.extend(data)
                 bytes_received += len(data)
                 
+                # Check for rotation messages in the buffer
+                # Protocol: 0xFF + 'R' + 'T' + rotation_value + 0xAA (5 bytes total)
+                while True:
+                    rot_idx = buffer.find(ROTATION_MAGIC_PREFIX)
+                    if rot_idx >= 0 and rot_idx + 5 <= len(buffer):
+                        # Found potential rotation message, verify suffix
+                        rotation_value = buffer[rot_idx + 3]
+                        suffix_byte = buffer[rot_idx + 4]
+                        
+                        # Validate: rotation must be 0-3 and suffix must be 0xAA
+                        if rotation_value <= 3 and suffix_byte == ROTATION_SUFFIX:
+                            current_rotation = rotation_value * 90  # 0, 90, 180, or 270
+                            logger.info(f"Rotation updated: {current_rotation} degrees")
+                            # Remove rotation message from buffer
+                            buffer = buffer[:rot_idx] + buffer[rot_idx + 5:]
+                        else:
+                            # False positive - pattern appeared in video data
+                            # Just skip past the prefix to continue searching
+                            buffer = buffer[:rot_idx] + buffer[rot_idx + 3:]
+                    else:
+                        break
+                
                 # Process NAL units
                 while True:
                     start = self._find_start_code(buffer, 0)
@@ -212,13 +258,17 @@ class StreamServer:
                     
                     frames = self.decoder.decode(nal_data)
                     for frame in frames:
+                        # Apply rotation if needed
+                        if current_rotation != 0:
+                            frame = self._rotate_frame(frame, current_rotation)
                         self.virtual_cam.send(frame)
                 
                 # Update stats
                 now = time.time()
                 if now - last_stats_time >= 1.0:
                     mbps = (bytes_received * 8) / (1024 * 1024)
-                    self.stats_callback(f"{self.decoder.fps:.1f} fps | {mbps:.1f} Mbps")
+                    rot_str = f" | Rot: {current_rotation}°" if current_rotation != 0 else ""
+                    self.stats_callback(f"{self.decoder.fps:.1f} fps | {mbps:.1f} Mbps{rot_str}")
                     bytes_received = 0
                     last_stats_time = now
                     
@@ -231,6 +281,16 @@ class StreamServer:
                 self.client_socket.close()
             self.status_callback("Disconnected - waiting for connection...")
             self.stats_callback("")
+    
+    def _rotate_frame(self, frame: np.ndarray, degrees: int) -> np.ndarray:
+        """Rotate frame by specified degrees (90, 180, 270)"""
+        if degrees == 90:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif degrees == 180:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        elif degrees == 270:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return frame
     
     def _find_start_code(self, data: bytearray, start: int) -> int:
         for i in range(start, len(data) - 3):
@@ -250,67 +310,172 @@ class StreamServer:
 
 
 class PhoneCamGUI:
-    """Main GUI application"""
+    """Main GUI application with modern Windows dark theme"""
+    
+    # Color scheme
+    BG_DARK = '#1e1e1e'
+    BG_CARD = '#2d2d2d'
+    BG_HOVER = '#3d3d3d'
+    ACCENT = '#0078d4'
+    ACCENT_HOVER = '#1a86d9'
+    TEXT = '#ffffff'
+    TEXT_DIM = '#888888'
+    SUCCESS = '#4ec9b0'
+    WARNING = '#dcdcaa'
+    ERROR = '#f14c4c'
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("PhoneCam RTSP Receiver")
-        self.root.geometry("450x350")
+        self.root.title("PhoneCam Receiver")
+        self.root.geometry("400x400")
         self.root.resizable(False, False)
+        self.root.configure(bg=self.BG_DARK)
+        
+        # Remove default title bar styling on Windows
+        try:
+            from ctypes import windll, byref, sizeof, c_int
+            HWND = windll.user32.GetParent(self.root.winfo_id())
+            # Enable dark mode title bar
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            windll.dwmapi.DwmSetWindowAttribute(HWND, DWMWA_USE_IMMERSIVE_DARK_MODE, byref(c_int(1)), sizeof(c_int))
+        except:
+            pass
         
         # Server
         self.server = None
         self.port = 5000
+        self.is_running = False
         
+        self._create_styles()
         self._create_ui()
         self._update_connection_info()
         
+    def _create_styles(self):
+        """Configure ttk styles for dark theme"""
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        # Frame styles
+        style.configure('Dark.TFrame', background=self.BG_DARK)
+        style.configure('Card.TFrame', background=self.BG_CARD)
+        
+        # Label styles
+        style.configure('Title.TLabel', 
+                       background=self.BG_DARK, 
+                       foreground=self.TEXT,
+                       font=('Segoe UI', 18, 'bold'))
+        style.configure('Subtitle.TLabel',
+                       background=self.BG_DARK,
+                       foreground=self.TEXT_DIM,
+                       font=('Segoe UI', 9))
+        style.configure('Dark.TLabel',
+                       background=self.BG_CARD,
+                       foreground=self.TEXT,
+                       font=('Segoe UI', 10))
+        style.configure('IP.TLabel',
+                       background=self.BG_CARD,
+                       foreground=self.ACCENT,
+                       font=('Consolas', 14, 'bold'))
+        style.configure('Status.TLabel',
+                       background=self.BG_CARD,
+                       foreground=self.TEXT_DIM,
+                       font=('Segoe UI', 10))
+        style.configure('Stats.TLabel',
+                       background=self.BG_CARD,
+                       foreground=self.SUCCESS,
+                       font=('Consolas', 11))
+        style.configure('Warning.TLabel',
+                       background=self.BG_DARK,
+                       foreground=self.WARNING,
+                       font=('Segoe UI', 9))
+        
+        # Button styles
+        style.configure('Accent.TButton',
+                       background=self.ACCENT,
+                       foreground=self.TEXT,
+                       font=('Segoe UI', 10, 'bold'),
+                       padding=(20, 10))
+        style.map('Accent.TButton',
+                 background=[('active', self.ACCENT_HOVER), ('pressed', self.ACCENT)])
+        
+        style.configure('Secondary.TButton',
+                       background=self.BG_CARD,
+                       foreground=self.TEXT,
+                       font=('Segoe UI', 10),
+                       padding=(20, 10))
+        style.map('Secondary.TButton',
+                 background=[('active', self.BG_HOVER)])
+        
     def _create_ui(self):
-        # Main frame with padding
-        main = ttk.Frame(self.root, padding=20)
+        # Main container
+        main = ttk.Frame(self.root, style='Dark.TFrame', padding=24)
         main.pack(fill=tk.BOTH, expand=True)
         
-        # Title
-        title = ttk.Label(main, text="PhoneCam RTSP Receiver", font=('Segoe UI', 16, 'bold'))
-        title.pack(pady=(0, 10))
+        # Header
+        ttk.Label(main, text="PhoneCam", style='Title.TLabel').pack(anchor=tk.W)
+        ttk.Label(main, text="Virtual Camera Receiver", style='Subtitle.TLabel').pack(anchor=tk.W, pady=(0, 20))
         
-        subtitle = ttk.Label(main, text="H.264 over TCP → Unity Capture", font=('Segoe UI', 10))
-        subtitle.pack(pady=(0, 20))
+        # Connection card
+        card = tk.Frame(main, bg=self.BG_CARD, padx=16, pady=14)
+        card.pack(fill=tk.X, pady=(0, 12))
         
-        # Connection info frame
-        info_frame = ttk.LabelFrame(main, text="Connection Info", padding=10)
-        info_frame.pack(fill=tk.X, pady=(0, 15))
+        # IP Address display
+        ip_header = tk.Label(card, text="CONNECT TO", bg=self.BG_CARD, fg=self.TEXT_DIM, 
+                            font=('Segoe UI', 8), anchor='w')
+        ip_header.pack(fill=tk.X)
         
-        self.ip_label = ttk.Label(info_frame, text="IP: Loading...", font=('Consolas', 11))
-        self.ip_label.pack(anchor=tk.W)
+        self.ip_label = tk.Label(card, text="Loading...", bg=self.BG_CARD, fg=self.ACCENT,
+                                 font=('Consolas', 16, 'bold'), anchor='w')
+        self.ip_label.pack(fill=tk.X, pady=(2, 0))
         
-        self.port_label = ttk.Label(info_frame, text=f"Port: {self.port}", font=('Consolas', 11))
-        self.port_label.pack(anchor=tk.W)
+        # Status card
+        status_card = tk.Frame(main, bg=self.BG_CARD, padx=16, pady=12)
+        status_card.pack(fill=tk.X, pady=(0, 16))
         
-        # Status frame
-        status_frame = ttk.LabelFrame(main, text="Status", padding=10)
-        status_frame.pack(fill=tk.X, pady=(0, 15))
+        status_header = tk.Label(status_card, text="STATUS", bg=self.BG_CARD, fg=self.TEXT_DIM,
+                                font=('Segoe UI', 8), anchor='w')
+        status_header.pack(fill=tk.X)
         
-        self.status_label = ttk.Label(status_frame, text="Ready to start", font=('Segoe UI', 10))
-        self.status_label.pack(anchor=tk.W)
+        self.status_label = tk.Label(status_card, text="Ready", bg=self.BG_CARD, fg=self.TEXT,
+                                     font=('Segoe UI', 11), anchor='w')
+        self.status_label.pack(fill=tk.X, pady=(2, 0))
         
-        self.stats_label = ttk.Label(status_frame, text="", font=('Consolas', 10), foreground='green')
-        self.stats_label.pack(anchor=tk.W)
+        self.stats_label = tk.Label(status_card, text="", bg=self.BG_CARD, fg=self.SUCCESS,
+                                    font=('Consolas', 10), anchor='w')
+        self.stats_label.pack(fill=tk.X)
+        
+        self.decoder_label = tk.Label(status_card, text="", bg=self.BG_CARD, fg=self.TEXT_DIM,
+                                      font=('Segoe UI', 9), anchor='w')
+        self.decoder_label.pack(fill=tk.X)
         
         # Buttons
-        btn_frame = ttk.Frame(main)
-        btn_frame.pack(fill=tk.X)
+        btn_frame = tk.Frame(main, bg=self.BG_DARK)
+        btn_frame.pack(fill=tk.X, pady=(4, 0))
         
-        self.start_btn = ttk.Button(btn_frame, text="Start Server", command=self._toggle_server)
-        self.start_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+        self.start_btn = tk.Button(btn_frame, text="Start Server", 
+                                   bg=self.ACCENT, fg=self.TEXT,
+                                   activebackground=self.ACCENT_HOVER, activeforeground=self.TEXT,
+                                   font=('Segoe UI', 10, 'bold'),
+                                   relief='flat', cursor='hand2',
+                                   padx=20, pady=8,
+                                   command=self._toggle_server)
+        self.start_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
         
-        quit_btn = ttk.Button(btn_frame, text="Quit", command=self._quit)
-        quit_btn.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(5, 0))
+        quit_btn = tk.Button(btn_frame, text="Quit",
+                            bg=self.BG_CARD, fg=self.TEXT,
+                            activebackground=self.BG_HOVER, activeforeground=self.TEXT,
+                            font=('Segoe UI', 10),
+                            relief='flat', cursor='hand2',
+                            padx=20, pady=8,
+                            command=self._quit)
+        quit_btn.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(6, 0))
         
         # Virtual camera warning
         if not PYVIRTUALCAM_AVAILABLE:
-            warn = ttk.Label(main, text="⚠ pyvirtualcam not installed", foreground='red')
-            warn.pack(pady=(10, 0))
+            warn = tk.Label(main, text="⚠ Virtual camera not available", 
+                           bg=self.BG_DARK, fg=self.WARNING,
+                           font=('Segoe UI', 9))
+            warn.pack(pady=(12, 0))
     
     def _update_connection_info(self):
         try:
@@ -318,9 +483,9 @@ class PhoneCamGUI:
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
-            self.ip_label.config(text=f"Enter on phone: {ip}:{self.port}")
+            self.ip_label.config(text=f"{ip}:{self.port}")
         except:
-            self.ip_label.config(text="IP: Unable to detect")
+            self.ip_label.config(text="Unable to detect IP")
     
     def _toggle_server(self):
         if self.server is None:
@@ -331,36 +496,61 @@ class PhoneCamGUI:
     def _start_server(self):
         self.server = StreamServer(
             self.port,
-            lambda s: self.root.after(0, lambda: self.status_label.config(text=s)),
-            lambda s: self.root.after(0, lambda: self.stats_label.config(text=s))
+            lambda s: self.root.after(0, lambda: self._update_status(s)),
+            lambda s: self.root.after(0, lambda: self.stats_label.config(text=s)),
+            lambda s: self.root.after(0, lambda: self.decoder_label.config(text=s))
         )
         self.server.start()
-        self.start_btn.config(text="Stop Server")
-        self.status_label.config(text="Starting server...")
+        self.is_running = True
+        self.start_btn.config(text="Stop Server", bg=self.ERROR, activebackground='#ff6b6b')
+        self.status_label.config(text="Starting...", fg=self.TEXT)
+        self.decoder_label.config(text="")
     
     def _stop_server(self):
         if self.server:
             self.server.stop()
             self.server = None
-        self.start_btn.config(text="Start Server")
-        self.status_label.config(text="Server stopped")
+        self.is_running = False
+        self.start_btn.config(text="Start Server", bg=self.ACCENT, activebackground=self.ACCENT_HOVER)
+        self.status_label.config(text="Stopped", fg=self.TEXT_DIM)
         self.stats_label.config(text="")
+        self.decoder_label.config(text="")
+    
+    def _update_status(self, status: str):
+        self.status_label.config(text=status)
+        # Color code status
+        if "Connected" in status:
+            self.status_label.config(fg=self.SUCCESS)
+        elif "Waiting" in status:
+            self.status_label.config(fg=self.TEXT)
+        elif "Error" in status or "failed" in status.lower():
+            self.status_label.config(fg=self.ERROR)
+        else:
+            self.status_label.config(fg=self.TEXT)
     
     def _quit(self):
         self._stop_server()
         self.root.quit()
     
     def run(self):
+        # Center window on screen
+        self.root.update_idletasks()
+        x = (self.root.winfo_screenwidth() - self.root.winfo_width()) // 2
+        y = (self.root.winfo_screenheight() - self.root.winfo_height()) // 2
+        self.root.geometry(f"+{x}+{y}")
         self.root.mainloop()
 
 
 def main():
     # Check dependencies
-    try:
-        import av
-    except ImportError:
-        print("ERROR: PyAV not installed. Run: pip install av")
+    if not PYAV_AVAILABLE:
+        print("ERROR: PyAV not installed!")
+        print("Install with: pip install av")
         sys.exit(1)
+    
+    print("PhoneCam Receiver starting...")
+    print(f"  Decoder: PyAV CPU (8 threads, low-latency)")
+    print(f"  Virtual Camera: {'Available' if PYVIRTUALCAM_AVAILABLE else 'Not available'}")
     
     if not PYVIRTUALCAM_AVAILABLE:
         print("WARNING: pyvirtualcam not installed. Virtual camera output disabled.")

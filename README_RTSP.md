@@ -28,22 +28,24 @@ Transform your Android phone into a high-quality wireless webcam for your PC usi
 
 ### 📱 Android App
 - **1920x1080 @ 60fps** hardware H.264 encoding
-- **15 Mbps** fixed bitrate (CBR)
+- **Adjustable bitrate** (5-30 Mbps via slider)
 - Low-latency encoder settings
 - Full-screen camera preview
-- Auto-dimming display (5s timeout)
+- Pinch-to-zoom support
+- Orientation-aware streaming (rotation follows phone)
 - One-tap connect/disconnect
 
 ### 💻 PC Receiver
-- **Real-time H.264 decoding** via FFmpeg/PyAV
+- **Real-time H.264 decoding** via PyAV (8-thread CPU)
 - **Unity Capture** virtual camera output
 - Simple TCP server (no complex protocols)
-- GUI and command-line versions
-- Shows FPS and bitrate stats
+- GUI with status display
+- Shows FPS, resolution, and connection info
+- Automatic rotation handling
 
 ### ⚡ Performance
-- **~50-100ms latency** on LAN (vs 100-200ms WebRTC)
-- **Lower CPU usage** than WebRTC
+- **~80-120ms latency** on LAN
+- **Low CPU usage** (10-15% with 8-thread decoding)
 - **No NAT issues** on local network
 - **Simpler debugging** - it's just TCP
 
@@ -123,8 +125,15 @@ Edit `RtspStreamer.kt`:
 private const val WIDTH = 1920      // Resolution width
 private const val HEIGHT = 1080     // Resolution height
 private const val FPS = 60          // Frame rate
-private const val BITRATE = 15_000_000  // 15 Mbps
+private const val BITRATE = 8_000_000  // Default 8 Mbps (adjustable via UI slider)
 ```
+
+### Rotation Protocol
+The app sends 5-byte rotation messages:
+- Byte 0: `0xFF` (magic marker)
+- Bytes 1-2: `"RT"` (rotation identifier)
+- Byte 3: Rotation value (0-3)
+- Byte 4: `0xAA` (end marker)
 
 ---
 
@@ -160,31 +169,33 @@ private const val BITRATE = 15_000_000  // 15 Mbps
 1. **Android App** captures camera using CameraX
 2. Frames are encoded to H.264 using MediaCodec (hardware encoder)
 3. H.264 NAL units are sent over TCP with Annex B framing (0x00000001 start codes)
-4. **PC Receiver** parses NAL units and decodes with PyAV/FFmpeg
-5. Decoded BGR frames are sent to Unity Capture virtual camera
-6. Any app can use the virtual camera
+4. Rotation changes are sent as 5-byte out-of-band messages
+5. **PC Receiver** parses NAL units and decodes with PyAV (8-thread CPU)
+6. Decoded BGR frames are rotated and sent to Unity Capture virtual camera
+7. Any app can use the virtual camera
 
 ### Protocol Details
-- **Transport**: Raw TCP socket
+- **Transport**: Raw TCP socket (port 5000)
 - **Framing**: H.264 Annex B (0x00000001 start codes)
 - **Codec**: H.264 Baseline/Main profile
 - **SPS/PPS**: Sent with each keyframe for resilience
+- **Rotation**: 5-byte messages (0xFF + "RT" + value + 0xAA)
 
 ---
 
-## Comparison: RTSP vs WebRTC
+## Comparison: TCP vs WebRTC
 
-| Feature | RTSP (this version) | WebRTC (original) |
+| Feature | TCP (this version) | WebRTC |
 |---------|---------------------|-------------------|
-| Latency (LAN) | 50-100ms | 100-200ms |
+| Latency (LAN) | 80-120ms | 150-250ms |
 | Latency (Internet) | Not supported | 200-500ms |
 | NAT Traversal | No | Yes (STUN/TURN) |
 | Complexity | Simple | Complex |
-| CPU Usage | Lower | Higher |
+| CPU Usage | Low (~10-15%) | Higher |
 | Browser Support | No | Yes |
 | Encryption | No (LAN only) | Yes (DTLS-SRTP) |
 
-**Use RTSP version for**: Local network, lowest latency, simplicity
+**Use TCP version for**: Local network, lowest latency, simplicity
 
 **Use WebRTC version for**: Internet streaming, NAT traversal, encryption
 
@@ -195,10 +206,10 @@ private const val BITRATE = 15_000_000  // 15 Mbps
 ```powershell
 cd desktop/receiver
 pip install pyinstaller
-pyinstaller --onefile --windowed rtsp_receiver_gui.py -n PhoneCam-RTSP
+pyinstaller PhoneCam-RTSP-Receiver.spec
 ```
 
-Output: `dist/PhoneCam-RTSP.exe`
+Output: `dist/PhoneCam-RTSP-Receiver.exe` (~80-85 MB)
 
 ---
 

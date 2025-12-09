@@ -42,14 +42,31 @@ import java.util.concurrent.atomic.AtomicLong
 class RtspStreamer(
     private val context: Context,
     initialBitrateMbps: Int = 15,
+    private var width: Int = 1920,
+    private var height: Int = 1080,
+    private var fps: Int = 60,
     private val statusCallback: (String) -> Unit
 ) {
     companion object {
         private const val TAG = "RtspStreamer"
-        private const val WIDTH = 1920
-        private const val HEIGHT = 1080
-        private const val FPS = 60
         private const val I_FRAME_INTERVAL = 1 // Keyframe every 1 second
+    }
+    
+    /**
+     * Set resolution (call before connect)
+     */
+    fun setResolution(w: Int, h: Int) {
+        width = w
+        height = h
+        Log.d(TAG, "Resolution set to ${w}x${h}")
+    }
+    
+    /**
+     * Set frame rate (call before connect)
+     */
+    fun setFrameRate(newFps: Int) {
+        fps = newFps
+        Log.d(TAG, "Frame rate set to $newFps fps")
     }
 
     private val encoderThread = HandlerThread("EncoderThread").apply { start() }
@@ -79,6 +96,20 @@ class RtspStreamer(
     // Current zoom level
     private var currentZoom = 1.0f
     
+    // Preview reference for rotation updates
+    private var currentPreview: Preview? = null
+    
+    // Orientation listener for stream rotation
+    private var orientationListener: android.view.OrientationEventListener? = null
+    
+    // Current rotation in degrees (0, 90, 180, 270)
+    private val currentRotationDegrees = AtomicInteger(0)
+    
+    // Protocol magic bytes for rotation messages: 0xFF + "RT" + rotation + 0xAA
+    // Using non-ASCII prefix/suffix to avoid false positives in H.264 data
+    private val ROTATION_MAGIC = byteArrayOf(0xFF.toByte(), 0x52, 0x54) // 0xFF + "RT"
+    private val ROTATION_SUFFIX = 0xAA.toByte()
+    
     // Zoom state callback
     var onZoomStateChanged: ((minZoom: Float, maxZoom: Float, currentZoom: Float) -> Unit)? = null
 
@@ -105,6 +136,94 @@ class RtspStreamer(
      * Get the camera instance for external zoom control
      */
     fun getCamera(): Camera? = camera
+    
+    /**
+     * Setup orientation listener to update stream rotation based on device orientation
+     */
+    private fun setupOrientationListener() {
+        orientationListener?.disable()
+        
+        orientationListener = object : android.view.OrientationEventListener(context) {
+            // Use time-based stability: only change rotation if new orientation is held for this duration
+            private var pendingRotation = -1
+            private var pendingStartTime = 0L
+            private val STABILITY_DURATION_MS = 500L  // Must hold new orientation for 500ms
+            private val MIN_CHANGE_INTERVAL_MS = 2000L  // Minimum 2 seconds between actual changes
+            private var lastActualChangeTime = 0L
+            
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return
+                
+                // Determine target rotation based on orientation
+                // Only landscape orientations are valid
+                val targetRotation: Int = when {
+                    // Landscape left (device rotated clockwise): 60-120 degrees
+                    orientation in 60..120 -> 180
+                    // Landscape right (device rotated counter-clockwise): 240-300 degrees  
+                    orientation in 240..300 -> 0
+                    else -> return  // Portrait or in transition zone - ignore
+                }
+                
+                val currentRotation = currentRotationDegrees.get()
+                val currentTime = System.currentTimeMillis()
+                
+                // If same as current, reset pending
+                if (targetRotation == currentRotation) {
+                    pendingRotation = -1
+                    return
+                }
+                
+                // Check if enough time since last change
+                if ((currentTime - lastActualChangeTime) < MIN_CHANGE_INTERVAL_MS) {
+                    return
+                }
+                
+                // If this is a new pending rotation, start timing
+                if (targetRotation != pendingRotation) {
+                    pendingRotation = targetRotation
+                    pendingStartTime = currentTime
+                    return
+                }
+                
+                // Check if held long enough
+                if ((currentTime - pendingStartTime) >= STABILITY_DURATION_MS) {
+                    lastActualChangeTime = currentTime
+                    currentRotationDegrees.set(targetRotation)
+                    pendingRotation = -1
+                    Log.d(TAG, "Rotation changed: $currentRotation -> $targetRotation (held for ${currentTime - pendingStartTime}ms)")
+                    sendRotationUpdate(targetRotation)
+                }
+            }
+        }
+        
+        if (orientationListener?.canDetectOrientation() == true) {
+            orientationListener?.enable()
+            Log.d(TAG, "Orientation listener enabled")
+        } else {
+            Log.w(TAG, "Cannot detect orientation")
+        }
+    }
+    
+    /**
+     * Send rotation update to receiver
+     */
+    private fun sendRotationUpdate(degrees: Int) {
+        networkHandler.post {
+            try {
+                val out = outputStream ?: return@post
+                synchronized(out) {
+                    // Send: 0xFF + "RT" + rotation byte (0=0°, 1=90°, 2=180°, 3=270°) + 0xAA
+                    out.write(ROTATION_MAGIC)  // 0xFF + "RT" (3 bytes)
+                    out.write(degrees / 90)    // rotation (1 byte)
+                    out.write(ROTATION_SUFFIX.toInt())  // 0xAA suffix (1 byte)
+                    out.flush()
+                }
+                Log.d(TAG, "Sent rotation: $degrees degrees")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to send rotation", e)
+            }
+        }
+    }
 
     fun connect(serverUrl: String, lifecycleOwner: LifecycleOwner) {
         if (isStreaming.get()) {
@@ -136,6 +255,16 @@ class RtspStreamer(
                 }
                 outputStream = socket!!.getOutputStream()
                 
+                // Send initial rotation (default to landscape = 0)
+                try {
+                    outputStream!!.write(ROTATION_MAGIC)
+                    outputStream!!.write(currentRotationDegrees.get() / 90)
+                    outputStream!!.flush()
+                    Log.d(TAG, "Sent initial rotation: ${currentRotationDegrees.get()}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to send initial rotation", e)
+                }
+                
                 Log.d(TAG, "TCP connected, starting encoder")
                 statusCallback("Connected, starting encoder...")
                 
@@ -157,10 +286,10 @@ class RtspStreamer(
             val bitrate = currentBitrateMbps.get() * 1_000_000
             
             // Create H.264 encoder
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT).apply {
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
                 setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
                 
@@ -182,7 +311,7 @@ class RtspStreamer(
                 start()
             }
 
-            Log.d(TAG, "Encoder created: ${WIDTH}x${HEIGHT}@${FPS}fps, ${currentBitrateMbps.get()}Mbps")
+            Log.d(TAG, "Encoder created: ${width}x${height}@${fps}fps, ${currentBitrateMbps.get()}Mbps")
             
             isStreaming.set(true)
             frameCount.set(0)
@@ -213,16 +342,21 @@ class RtspStreamer(
                 
                 cameraProvider?.unbindAll()
 
-                // Preview for encoder with 60fps target using Camera2 Interop
+                // Get current display rotation for proper stream orientation
+                val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+                val displayRotation = windowManager.defaultDisplay.rotation
+
+                // Preview for encoder with target fps using Camera2 Interop
                 val previewBuilder = Preview.Builder()
-                    .setTargetResolution(Size(WIDTH, HEIGHT))
+                    .setTargetResolution(Size(width, height))
+                    .setTargetRotation(displayRotation)  // Match display rotation
                 
-                // Use Camera2 Interop to request 60fps
+                // Use Camera2 Interop to request target fps
                 @Suppress("UnsafeOptInUsageError")
                 Camera2Interop.Extender(previewBuilder)
                     .setCaptureRequestOption(
                         CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                        Range(FPS, FPS)
+                        Range(fps, fps)
                     )
                 
                 val encoderPreview = previewBuilder.build()
@@ -247,6 +381,12 @@ class RtspStreamer(
                     encoderPreview
                 )
                 
+                // Store preview reference for rotation updates
+                currentPreview = encoderPreview
+                
+                // Setup orientation listener to update stream rotation
+                setupOrientationListener()
+                
                 // Apply current zoom and observe zoom state
                 camera?.cameraControl?.setZoomRatio(currentZoom)
                 
@@ -257,7 +397,13 @@ class RtspStreamer(
 
                 Log.d(TAG, "Camera bound to encoder")
                 val mbps = currentBitrateMbps.get()
-                statusCallback("Streaming 1080p60 @ ${mbps}Mbps")
+                val resLabel = when (height) {
+                    1080 -> "1080p"
+                    720 -> "720p"
+                    480 -> "480p"
+                    else -> "${height}p"
+                }
+                statusCallback("Streaming $resLabel$fps @ ${mbps}Mbps")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Camera binding failed", e)
@@ -417,6 +563,11 @@ class RtspStreamer(
         val wasStreaming = isStreaming.getAndSet(false)
         
         Log.d(TAG, "Disconnecting, was streaming: $wasStreaming")
+        
+        // Disable orientation listener
+        orientationListener?.disable()
+        orientationListener = null
+        currentPreview = null
         
         // Stop encoder
         encoderHandler.post {

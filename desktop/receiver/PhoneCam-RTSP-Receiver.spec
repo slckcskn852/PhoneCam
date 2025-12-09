@@ -1,11 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
+"""
+PhoneCam RTSP Receiver - PyInstaller Spec File
+Low-latency CPU decoding with PyAV
+"""
+import os
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['av', 'pyvirtualcam', 'numpy', 'tkinter']
+hiddenimports = ['av', 'pyvirtualcam', 'numpy', 'tkinter', 'cv2']
+
+# Collect PyAV
 tmp_ret = collect_all('av')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+# Collect pyvirtualcam
 tmp_ret = collect_all('pyvirtualcam')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

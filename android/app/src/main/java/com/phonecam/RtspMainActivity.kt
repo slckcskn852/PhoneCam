@@ -1,6 +1,8 @@
 package com.phonecam
 
 import android.Manifest
+import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.os.Build
@@ -13,6 +15,8 @@ import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,6 +37,7 @@ import kotlinx.coroutines.cancel
 class RtspMainActivity : AppCompatActivity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private lateinit var client: RtspStreamer
+    private lateinit var prefs: SharedPreferences
 
     // Connection page views
     private lateinit var connectionPage: View
@@ -41,6 +46,8 @@ class RtspMainActivity : AppCompatActivity() {
     private lateinit var connectBtn: Button
     private lateinit var bitrateSlider: SeekBar
     private lateinit var bitrateLabel: TextView
+    private lateinit var resolutionGroup: RadioGroup
+    private lateinit var fpsGroup: RadioGroup
 
     // Preview page views
     private lateinit var previewPage: View
@@ -50,6 +57,9 @@ class RtspMainActivity : AppCompatActivity() {
 
     private var isConnected = false
     private var currentBitrateMbps = 15
+    private var currentWidth = 1920
+    private var currentHeight = 1080
+    private var currentFps = 60
 
     // Zoom support
     private var currentZoom = 1.0f
@@ -72,6 +82,10 @@ class RtspMainActivity : AppCompatActivity() {
         
         // Keep screen on
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        
+        // Load saved preferences
+        prefs = getSharedPreferences("phonecam_prefs", Context.MODE_PRIVATE)
+        loadPreferences()
 
         // Initialize connection page views
         connectionPage = findViewById(R.id.connectionPage)
@@ -80,15 +94,20 @@ class RtspMainActivity : AppCompatActivity() {
         connectBtn = findViewById(R.id.connectBtn)
         bitrateSlider = findViewById(R.id.bitrateSlider)
         bitrateLabel = findViewById(R.id.bitrateLabel)
+        resolutionGroup = findViewById(R.id.resolutionGroup)
+        fpsGroup = findViewById(R.id.fpsGroup)
 
         // Initialize preview page views
         previewPage = findViewById(R.id.previewPage)
         zoomLabel = findViewById(R.id.zoomLabel)
         streamStatusText = findViewById(R.id.streamStatusText)
         disconnectBtn = findViewById(R.id.disconnectBtn)
+        
+        // Restore saved values to UI
+        urlInput.setText(prefs.getString("server_url", ""))
 
-        // Initialize RTSP streamer
-        client = RtspStreamer(this, currentBitrateMbps) { status ->
+        // Initialize RTSP streamer with saved settings
+        client = RtspStreamer(this, currentBitrateMbps, currentWidth, currentHeight, currentFps) { status ->
             runOnUiThread {
                 if (isConnected) {
                     streamStatusText.text = status
@@ -135,6 +154,34 @@ class RtspMainActivity : AppCompatActivity() {
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
         })
+
+        // Setup resolution radio buttons
+        when (currentHeight) {
+            1080 -> resolutionGroup.check(R.id.res1080p)
+            720 -> resolutionGroup.check(R.id.res720p)
+            else -> resolutionGroup.check(R.id.res1080p)
+        }
+        resolutionGroup.setOnCheckedChangeListener { _, checkedId ->
+            when (checkedId) {
+                R.id.res1080p -> { currentWidth = 1920; currentHeight = 1080 }
+                R.id.res720p -> { currentWidth = 1280; currentHeight = 720 }
+            }
+            client.setResolution(currentWidth, currentHeight)
+        }
+
+        // Setup FPS radio buttons
+        when (currentFps) {
+            60 -> fpsGroup.check(R.id.fps60)
+            30 -> fpsGroup.check(R.id.fps30)
+        }
+        fpsGroup.setOnCheckedChangeListener { _, checkedId ->
+            currentFps = when (checkedId) {
+                R.id.fps60 -> 60
+                R.id.fps30 -> 30
+                else -> 60
+            }
+            client.setFrameRate(currentFps)
+        }
 
         // Setup pinch-to-zoom for preview page
         scaleGestureDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -185,8 +232,8 @@ class RtspMainActivity : AppCompatActivity() {
     }
 
     private fun showConnectionPage() {
-        // Allow any orientation on connection page
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        // Lock to portrait on connection page
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         
         connectionPage.visibility = View.VISIBLE
         previewPage.visibility = View.GONE
@@ -245,6 +292,24 @@ class RtspMainActivity : AppCompatActivity() {
             permissionLauncher.launch(needed.toTypedArray())
         }
     }
+    
+    private fun loadPreferences() {
+        currentBitrateMbps = prefs.getInt("bitrate", 15)
+        currentWidth = prefs.getInt("width", 1920)
+        currentHeight = prefs.getInt("height", 1080)
+        currentFps = prefs.getInt("fps", 60)
+    }
+    
+    private fun savePreferences() {
+        prefs.edit().apply {
+            putString("server_url", urlInput.text.toString())
+            putInt("bitrate", currentBitrateMbps)
+            putInt("width", currentWidth)
+            putInt("height", currentHeight)
+            putInt("fps", currentFps)
+            apply()
+        }
+    }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
@@ -255,9 +320,15 @@ class RtspMainActivity : AppCompatActivity() {
             showConnectionPage()
             statusText.text = "Disconnected"
         } else {
+            savePreferences()
             @Suppress("DEPRECATION")
             super.onBackPressed()
         }
+    }
+    
+    override fun onPause() {
+        super.onPause()
+        savePreferences()
     }
 
     override fun onDestroy() {

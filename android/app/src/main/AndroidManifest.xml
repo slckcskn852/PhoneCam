@@ -20,8 +20,8 @@
         <activity
             android:name="com.phonecam.RtspMainActivity"
             android:exported="true"
-            android:screenOrientation="sensorLandscape"
-            android:configChanges="keyboard|keyboardHidden|orientation|screenSize">
+            android:screenOrientation="portrait"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
