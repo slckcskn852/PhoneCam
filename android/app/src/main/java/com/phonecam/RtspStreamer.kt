@@ -41,6 +41,7 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class RtspStreamer(
     private val context: Context,
+    private val previewView: androidx.camera.view.PreviewView,
     initialBitrateMbps: Int = 15,
     private var width: Int = 1920,
     private var height: Int = 1080,
@@ -89,6 +90,7 @@ class RtspStreamer(
     private var pps: ByteArray? = null
 
     private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private val bytesSent = AtomicLong(0)
     
     // Adjustable bitrate (in Mbps, capped at 30)
     private val currentBitrateMbps = AtomicInteger(initialBitrateMbps.coerceIn(5, 30))
@@ -284,15 +286,23 @@ class RtspStreamer(
     private fun startEncoder(lifecycleOwner: LifecycleOwner) {
         try {
             val bitrate = currentBitrateMbps.get() * 1_000_000
-            
-            // Create H.264 encoder
+
+            // Create H.264 encoder with baseline profile and level 3.1 for NVDEC compatibility
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-                
+                // Use VBR for better quality under motion
+                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                // Baseline profile (most compatible) and level 3.1
+                // MediaFormat expects keys named "profile" and "level" on many devices
+                try {
+                    setInteger("profile", MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                    setInteger("level", MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Profile/level keys not supported on this device")
+                }
                 // Low latency tuning
                 try {
                     setInteger(MediaFormat.KEY_LATENCY, 0)
@@ -342,9 +352,9 @@ class RtspStreamer(
                 
                 cameraProvider?.unbindAll()
 
-                // Get current display rotation for proper stream orientation
+                // Get current display rotation for proper stream orientation (prefer PreviewView display)
                 val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
-                val displayRotation = windowManager.defaultDisplay.rotation
+                val displayRotation = previewView.display?.rotation ?: windowManager.defaultDisplay.rotation
 
                 // Preview for encoder with target fps using Camera2 Interop
                 val previewBuilder = Preview.Builder()
@@ -374,11 +384,20 @@ class RtspStreamer(
                     }
                 }
 
-                // Bind preview to camera
+                // Bind preview to UI PreviewView using a separate Preview use-case
+                val uiPreview = Preview.Builder()
+                    .setTargetResolution(Size(width, height))
+                    .setTargetRotation(displayRotation)
+                    .build()
+
+                uiPreview.setSurfaceProvider(previewView.surfaceProvider)
+
+                // Bind both encoder preview (encoderPreview) and UI preview (uiPreview)
                 camera = cameraProvider?.bindToLifecycle(
                     lifecycleOwner,
                     cameraSelector,
-                    encoderPreview
+                    encoderPreview,
+                    uiPreview
                 )
                 
                 // Store preview reference for rotation updates
@@ -548,11 +567,22 @@ class RtspStreamer(
                     nalData[2] == 0x00.toByte() && 
                     nalData[3] == 0x01.toByte()
                 
+                var bytesWritten = 0
                 if (!hasStartCode) {
                     out.write(startCode)
+                    bytesWritten += startCode.size
                 }
                 out.write(nalData)
+                bytesWritten += nalData.size
                 out.flush()
+
+                // Account for SPS/PPS bytes if sent
+                if (isKeyFrame) {
+                    sps?.let { bytesWritten += startCode.size + it.size }
+                    pps?.let { bytesWritten += startCode.size + it.size }
+                }
+
+                bytesSent.addAndGet(bytesWritten.toLong())
             }
         } catch (e: Exception) {
             throw e // Propagate to caller

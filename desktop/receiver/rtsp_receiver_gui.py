@@ -55,17 +55,18 @@ class H264StreamDecoder:
         self.start_time = time.time()
         self.hw_accel = None
         self.codec = None
-        # Try NVDEC (GPU) first
+        # Try NVDEC (GPU) first, with all low-latency options
         try:
             self.codec = av.CodecContext.create('h264_cuvid', 'r')
+            self.codec.options = {'flags': 'low_delay', 'flags2': 'fast', 'delay': '0', 'fflags': 'nobuffer'}
             self.hw_accel = "GPU (NVDEC)"
-            logger.info("H.264 decoder initialized (PyAV, NVDEC GPU)")
+            logger.info("H.264 decoder initialized (PyAV, NVDEC GPU, low-latency)")
         except Exception as e:
             logger.warning(f"NVDEC not available: {e}. Falling back to CPU decoding.")
             self.codec = av.CodecContext.create('h264', 'r')
             self.codec.thread_type = 'SLICE'
             self.codec.thread_count = 8
-            self.codec.options = {'flags': 'low_delay', 'flags2': 'fast'}
+            self.codec.options = {'flags': 'low_delay', 'flags2': 'fast', 'delay': '0', 'fflags': 'nobuffer'}
             self.hw_accel = "CPU (8 threads)"
             logger.info("H.264 decoder initialized (PyAV, 8 threads, low-latency)")
         
@@ -174,10 +175,10 @@ class StreamServer:
             while self.running:
                 try:
                     self.client_socket, addr = self.server_socket.accept()
-                    self.client_socket.settimeout(5.0)
+                    self.client_socket.settimeout(2.0)
                     # Low-latency socket options
                     self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)  # Smaller buffer = lower latency
+                    self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)  # Lower buffer for less latency
                     
                     logger.info(f"Client connected: {addr}")
                     self.status_callback(f"Connected: {addr[0]}")

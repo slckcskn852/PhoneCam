@@ -207,13 +207,22 @@
         android:visibility="gone"
         android:background="#FF000000">
 
-        <!-- Stream info in center -->
+        <!-- Camera Preview Surface -->
+        <androidx.camera.view.PreviewView
+            android:id="@+id/cameraPreview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center"
+            android:background="#000000" />
+
+        <!-- Stream info overlay in center -->
         <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_gravity="center"
             android:orientation="vertical"
-            android:gravity="center">
+            android:gravity="center"
+            android:background="@android:color/transparent">
 
             <TextView
                 android:layout_width="wrap_content"
@@ -268,6 +277,16 @@
             android:text="Pinch to zoom"
             android:textColor="#66FFFFFF"
             android:textSize="12sp" />
+
+        <!-- Fullscreen black overlay for AMOLED dim (shown after 10s connected) -->
+        <View
+            android:id="@+id/blackoutOverlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="#000000"
+            android:visibility="gone"
+            android:clickable="true"
+            android:focusable="true" />
 
     </FrameLayout>
 

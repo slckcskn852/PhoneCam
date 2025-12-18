@@ -7,6 +7,8 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -51,9 +53,16 @@ class RtspMainActivity : AppCompatActivity() {
 
     // Preview page views
     private lateinit var previewPage: View
+    private lateinit var cameraPreview: androidx.camera.view.PreviewView
     private lateinit var zoomLabel: TextView
     private lateinit var streamStatusText: TextView
     private lateinit var disconnectBtn: Button
+    private lateinit var blackoutOverlay: View
+
+    // UI handler for delayed blackout
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var blackoutRunnable: Runnable? = null
+    private var originalBrightness: Float = -1f
 
     private var isConnected = false
     private var currentBitrateMbps = 15
@@ -99,6 +108,7 @@ class RtspMainActivity : AppCompatActivity() {
 
         // Initialize preview page views
         previewPage = findViewById(R.id.previewPage)
+        cameraPreview = findViewById(R.id.cameraPreview)
         zoomLabel = findViewById(R.id.zoomLabel)
         streamStatusText = findViewById(R.id.streamStatusText)
         disconnectBtn = findViewById(R.id.disconnectBtn)
@@ -106,8 +116,15 @@ class RtspMainActivity : AppCompatActivity() {
         // Restore saved values to UI
         urlInput.setText(prefs.getString("server_url", ""))
 
+        // Blackout overlay (AMOLED dim)
+        blackoutOverlay = findViewById(R.id.blackoutOverlay)
+        blackoutOverlay.setOnClickListener {
+            // Hide overlay on user touch and restore brightness
+            cancelBlackout()
+        }
+
         // Initialize RTSP streamer with saved settings
-        client = RtspStreamer(this, currentBitrateMbps, currentWidth, currentHeight, currentFps) { status ->
+        client = RtspStreamer(this, cameraPreview, currentBitrateMbps, currentWidth, currentHeight, currentFps) { status ->
             runOnUiThread {
                 if (isConnected) {
                     streamStatusText.text = status
@@ -119,6 +136,8 @@ class RtspMainActivity : AppCompatActivity() {
                     if (!isConnected) {
                         isConnected = true
                         showPreviewPage()
+                        // Schedule AMOLED blackout after 10s of stable connection
+                        scheduleBlackout()
                     }
                 } else if (status.contains("Disconnected", ignoreCase = true) || 
                            status.contains("Error", ignoreCase = true) ||
@@ -126,6 +145,8 @@ class RtspMainActivity : AppCompatActivity() {
                     if (isConnected) {
                         isConnected = false
                         showConnectionPage()
+                        // Cancel any pending blackout and remove overlay
+                        cancelBlackout()
                     }
                     statusText.text = status
                 }
@@ -221,6 +242,7 @@ class RtspMainActivity : AppCompatActivity() {
         disconnectBtn.setOnClickListener {
             client.disconnect()
             isConnected = false
+            cancelBlackout()
             showConnectionPage()
             statusText.text = "Disconnected"
         }
@@ -268,6 +290,54 @@ class RtspMainActivity : AppCompatActivity() {
                 or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                 or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
             )
+        }
+        // store original brightness value (may be -1f for system default)
+        try {
+            originalBrightness = window.attributes.screenBrightness
+        } catch (e: Exception) {
+            originalBrightness = -1f
+        }
+    }
+
+    private fun scheduleBlackout() {
+        // cancel previous
+        blackoutRunnable?.let { uiHandler.removeCallbacks(it) }
+        blackoutRunnable = Runnable { showBlackoutOverlay() }
+        uiHandler.postDelayed(blackoutRunnable!!, 10_000)
+    }
+
+    private fun cancelBlackout() {
+        blackoutRunnable?.let { uiHandler.removeCallbacks(it) }
+        blackoutRunnable = null
+        hideBlackoutOverlay()
+    }
+
+    private fun showBlackoutOverlay() {
+        runOnUiThread {
+            try {
+                // Lower window brightness to near-zero for dimming (per-window only)
+                val lp = window.attributes
+                // save original if not already saved
+                if (originalBrightness < 0f) originalBrightness = lp.screenBrightness
+                lp.screenBrightness = 0.01f
+                window.attributes = lp
+            } catch (e: Exception) {
+                // ignore
+            }
+            blackoutOverlay.visibility = View.VISIBLE
+        }
+    }
+
+    private fun hideBlackoutOverlay() {
+        runOnUiThread {
+            blackoutOverlay.visibility = View.GONE
+            try {
+                val lp = window.attributes
+                lp.screenBrightness = originalBrightness
+                window.attributes = lp
+            } catch (e: Exception) {
+                // ignore
+            }
         }
     }
 
@@ -317,6 +387,7 @@ class RtspMainActivity : AppCompatActivity() {
             // Disconnect instead of exiting when on preview page
             client.disconnect()
             isConnected = false
+            cancelBlackout()
             showConnectionPage()
             statusText.text = "Disconnected"
         } else {
@@ -334,6 +405,7 @@ class RtspMainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        cancelBlackout()
         client.stop()
         scope.cancel()
     }
