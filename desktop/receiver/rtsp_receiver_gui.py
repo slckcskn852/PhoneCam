@@ -51,15 +51,23 @@ class H264StreamDecoder:
     """Low-latency H.264 decoder using PyAV with multithreading"""
     
     def __init__(self):
-        self.codec = av.CodecContext.create('h264', 'r')
-        self.codec.thread_type = 'SLICE'
-        self.codec.thread_count = 8
-        self.codec.options = {'flags': 'low_delay', 'flags2': 'fast'}
         self.frame_count = 0
         self.start_time = time.time()
-        self.hw_accel = "CPU (8 threads)"
-        
-        logger.info("H.264 decoder initialized (PyAV, 8 threads, low-latency)")
+        self.hw_accel = None
+        self.codec = None
+        # Try NVDEC (GPU) first
+        try:
+            self.codec = av.CodecContext.create('h264_cuvid', 'r')
+            self.hw_accel = "GPU (NVDEC)"
+            logger.info("H.264 decoder initialized (PyAV, NVDEC GPU)")
+        except Exception as e:
+            logger.warning(f"NVDEC not available: {e}. Falling back to CPU decoding.")
+            self.codec = av.CodecContext.create('h264', 'r')
+            self.codec.thread_type = 'SLICE'
+            self.codec.thread_count = 8
+            self.codec.options = {'flags': 'low_delay', 'flags2': 'fast'}
+            self.hw_accel = "CPU (8 threads)"
+            logger.info("H.264 decoder initialized (PyAV, 8 threads, low-latency)")
         
     def decode(self, data: bytes) -> list:
         """Decode H.264 NAL unit data and return BGR frames"""
@@ -293,10 +301,9 @@ class StreamServer:
         return frame
     
     def _find_start_code(self, data: bytearray, start: int) -> int:
-        for i in range(start, len(data) - 3):
-            if data[i] == 0 and data[i+1] == 0 and data[i+2] == 0 and data[i+3] == 1:
-                return i
-        return -1
+        # Use bytes.find() which is implemented in C - much faster than Python loop
+        START_CODE = b'\x00\x00\x00\x01'
+        return bytes(data).find(START_CODE, start)
     
     def _get_local_ip(self) -> str:
         try:

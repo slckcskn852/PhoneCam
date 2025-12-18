@@ -44,14 +44,22 @@ class H264Decoder:
     """Decodes H.264 Annex B stream using PyAV/FFmpeg"""
     
     def __init__(self):
-        self.codec = av.CodecContext.create('h264', 'r')
-        self.codec.thread_type = 'AUTO'
-        self.codec.thread_count = 0  # Auto
-        
-        # Buffer for incomplete NAL units
-        self.buffer = bytearray()
         self.frame_count = 0
         self.start_time = time.time()
+        self.hw_accel = None
+        self.codec = None
+        # Try NVDEC (GPU) first
+        try:
+            self.codec = av.CodecContext.create('h264_cuvid', 'r')
+            self.hw_accel = "GPU (NVDEC)"
+            logger.info("H.264 decoder initialized (PyAV, NVDEC GPU)")
+        except Exception as e:
+            logger.warning(f"NVDEC not available: {e}. Falling back to CPU decoding.")
+            self.codec = av.CodecContext.create('h264', 'r')
+            self.codec.thread_type = 'SLICE'
+            self.codec.thread_count = 4
+            self.hw_accel = "CPU (4 threads)"
+            logger.info("H.264 decoder initialized (PyAV, 4 threads, low-latency)")
         
     def decode(self, data: bytes) -> list:
         """Decode H.264 data and return list of numpy BGR frames"""
@@ -238,12 +246,11 @@ class RTSPServer:
             logger.info(f"Client session ended: {self.decoder.get_stats()}")
     
     def _find_start_code(self, data: bytearray, start: int) -> int:
-        """Find H.264 Annex B start code (0x00000001) in data"""
-        for i in range(start, len(data) - 3):
-            if (data[i] == 0x00 and data[i+1] == 0x00 and 
-                data[i+2] == 0x00 and data[i+3] == 0x01):
-                return i
-        return -1
+        """Find H.264 Annex B start code (0x00000001) in data using optimized search"""
+        # Use bytes.find() which is implemented in C and much faster than Python loop
+        START_CODE = b'\x00\x00\x00\x01'
+        pos = bytes(data).find(START_CODE, start)
+        return pos
     
     async def start(self):
         """Start the TCP server"""
@@ -295,6 +302,9 @@ def main():
     args = parser.parse_args()
     
     server = RTSPServer(args.host, args.port)
+    print("PhoneCam RTSP Receiver starting...")
+    print(f"  Decoder: {server.decoder.hw_accel}")
+    print(f"  Virtual Camera: {'Available' if PYVIRTUALCAM_AVAILABLE else 'Not available'}")
     
     # Handle Ctrl+C
     def signal_handler(sig, frame):

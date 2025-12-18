@@ -6,6 +6,7 @@ Uses NVDEC hardware-accelerated decoding by patching aiortc's decoder.
 import argparse
 import asyncio
 import logging
+import time
 from typing import List, Optional
 import numpy as np
 import av
@@ -66,6 +67,10 @@ connection_active: bool = False  # Track if a connection is active
 async def consume_video(track):
     """Read frames from track and send directly to virtual camera with NVDEC hardware decoding."""
     global virtual_cam
+    
+    # Target frame timing for CPU throttling (16.67ms for 60fps)
+    target_frame_time = 1.0 / 60.0
+    last_frame_time = 0
     
     try:
         LOG.info("Video track started, waiting for first frame to initialize camera...")
@@ -138,6 +143,13 @@ async def consume_video(track):
             # Ensure frame is contiguous before sending
             if not img.data.contiguous:
                 img = np.ascontiguousarray(img)
+            
+            # Throttle to prevent CPU spinning if frames arrive faster than target rate
+            current_time = time.perf_counter()
+            elapsed = current_time - last_frame_time
+            if elapsed < target_frame_time:
+                await asyncio.sleep(target_frame_time - elapsed)
+            last_frame_time = time.perf_counter()
             
             virtual_cam.send(img)
             frame_count += 1
